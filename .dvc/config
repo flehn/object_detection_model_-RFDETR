@@ -1,0 +1,5 @@
+[core]
+    remote = gcs_remote
+['remote "gcs_remote"']
+    url = gs://object-detection-model-weights
+    projectname = object-detection-model-496510

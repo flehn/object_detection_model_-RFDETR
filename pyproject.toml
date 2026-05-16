@@ -4,6 +4,8 @@ version = "0.1.0"
 description = "Add your description here"
 requires-python = ">=3.12"
 dependencies = [
+    "dvc>=3.67.1",
+    "dvc-gs>=3.0.2",
     "opencv-python>=4.13.0.92",
     "pandas>=3.0.2",
     "rfdetr[onnx]>=1.6.5",

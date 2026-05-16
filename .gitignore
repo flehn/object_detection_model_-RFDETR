@@ -12,3 +12,4 @@ outputs/
 *.csv
 weights/
 .DS_Store
+/weights

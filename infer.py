@@ -268,9 +268,6 @@ def process_video(
     team_classifier = TeamClassifier()
     box_annotator = sv.BoxAnnotator(color=DISPLAY_PALETTE, color_lookup=sv.ColorLookup.CLASS)
     label_annotator = sv.LabelAnnotator(color=DISPLAY_PALETTE, color_lookup=sv.ColorLookup.CLASS)
-    trace_annotator = sv.TraceAnnotator(
-        color=DISPLAY_PALETTE, color_lookup=sv.ColorLookup.CLASS, trace_length=60
-    )
 
     seen_a: set[int] = set()
     seen_b: set[int] = set()
@@ -302,7 +299,6 @@ def process_video(
                 visible["B"] = int((display.class_id == TEAM_B).sum())
                 visible["U"] = int((display.class_id == UNASSIGNED).sum())
                 visible["R"] = int((display.class_id == REFEREE).sum())
-                annotated = trace_annotator.annotate(annotated, display)
                 annotated = box_annotator.annotate(annotated, display)
                 annotated = label_annotator.annotate(annotated, display, labels=labels)
 

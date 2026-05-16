@@ -7,6 +7,7 @@ import argparse
 import csv
 from collections import defaultdict
 from pathlib import Path
+from typing import Protocol
 
 import cv2
 import numpy as np
@@ -16,6 +17,14 @@ from huggingface_hub import hf_hub_download
 from rfdetr.detr import RFDETRLarge
 from trackers import ByteTrackTracker, OCSORTTracker, SORTTracker
 from tqdm import tqdm
+
+from onnx_detector import OnnxDetector
+
+DEFAULT_ONNX_PATH = "weights/inference_model.onnx"
+
+
+class Detector(Protocol):
+    def predict(self, image_rgb: np.ndarray, threshold: float = ...) -> sv.Detections: ...
 
 MODEL_REPO = "julianzu9612/RFDETR-Soccernet"
 CHECKPOINT_FILE = "weights/checkpoint_best_regular.pth"
@@ -232,7 +241,7 @@ def _draw_overlay(frame: np.ndarray, visible: dict[str, int], unique: dict[str, 
 
 
 def process_video(
-    model: RFDETRLarge,
+    model: Detector,
     video_path: str,
     output_path: str,
     *,
@@ -358,22 +367,40 @@ def main() -> None:
         help="Tracking algorithm (default: bytetrack)",
     )
     parser.add_argument(
-        "--device",
-        default="auto",
-        help='Inference device: "auto" (default), "cuda", "cuda:N", "mps", or "cpu"',
+        "--backend",
+        choices=["pytorch", "onnx"],
+        default="pytorch",
+        help="Detection backend (default: pytorch)",
     )
     parser.add_argument(
-        "--checkpoint", help="Local model checkpoint path (downloads from HuggingFace if omitted)"
+        "--device",
+        default="auto",
+        help='PyTorch device: "auto" (default), "cuda", "cuda:N", "mps", or "cpu" (ignored for onnx)',
+    )
+    parser.add_argument(
+        "--checkpoint",
+        help="PyTorch checkpoint path (downloads from HuggingFace if omitted; ignored for onnx)",
+    )
+    parser.add_argument(
+        "--onnx-path",
+        default=DEFAULT_ONNX_PATH,
+        help=f"ONNX model path (default: {DEFAULT_ONNX_PATH})",
     )
     args = parser.parse_args()
 
     video_path = Path(args.video)
     output = args.output or str(video_path.with_name(video_path.stem + "_tracked.mp4"))
 
-    device = resolve_device(args.device)
-    source = args.checkpoint if args.checkpoint else MODEL_REPO
-    print(f"Loading model from {source} onto {device}...")
-    model = load_model(args.checkpoint, device)
+    model: Detector
+    if args.backend == "onnx":
+        print(f"Loading ONNX model from {args.onnx_path}...")
+        model = OnnxDetector(args.onnx_path)
+        print(f"ORT providers: {model.providers}")
+    else:
+        device = resolve_device(args.device)
+        source = args.checkpoint if args.checkpoint else MODEL_REPO
+        print(f"Loading PyTorch model from {source} onto {device}...")
+        model = load_model(args.checkpoint, device)
 
     process_video(
         model,

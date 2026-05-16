@@ -5,7 +5,10 @@ __pycache__/
 .python-version
 *.pth
 *.pt
+*.onnx
 outputs/
 *.mp4
 *.avi
+*.csv
+weights/
 .DS_Store

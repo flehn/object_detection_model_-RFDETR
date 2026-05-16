@@ -6,7 +6,7 @@ requires-python = ">=3.12"
 dependencies = [
     "opencv-python>=4.13.0.92",
     "pandas>=3.0.2",
-    "rfdetr>=1.6.5",
+    "rfdetr[onnx]>=1.6.5",
     "tqdm>=4.67.3",
     "trackers>=2.3.0",
 ]

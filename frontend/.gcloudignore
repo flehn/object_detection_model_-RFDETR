@@ -1,0 +1,8 @@
+# Files excluded when running `gcloud builds submit` from this directory.
+
+.git/
+node_modules/
+dist/
+.env*
+.DS_Store
+*.log

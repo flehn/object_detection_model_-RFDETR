@@ -1,0 +1,152 @@
+# ── Cloud Build pipeline ──────────────────────────────────────────────────────
+#
+# PRE-REQUISITES (one-time setup, run from your local machine):
+#
+#   1. Enable APIs
+#      gcloud services enable \
+#        cloudbuild.googleapis.com \
+#        run.googleapis.com \
+#        artifactregistry.googleapis.com \
+#        --project=object-detection-model-496510
+#
+#   2. Request L4 GPU quota in europe-west4 (one-time, free request):
+#      Console → IAM & Admin → Quotas → search
+#      "Total Nvidia L4 GPU allocation, per project per region"
+#      → request 1 in europe-west4. Approval usually takes a few hours.
+#
+#   3. Create Artifact Registry repository (must be in same region as Cloud Run
+#      to avoid cross-region egress charges):
+#      gcloud artifacts repositories create object-tracker \
+#        --repository-format=docker \
+#        --location=europe-west4 \
+#        --project=object-detection-model-496510
+#
+#   4. Grant Cloud Build SA access to the weights bucket
+#      PROJECT_NUMBER=$(gcloud projects describe object-detection-model-496510 \
+#        --format="value(projectNumber)")
+#      gcloud storage buckets add-iam-policy-binding gs://object-detection-model-weights \
+#        --member="serviceAccount:${PROJECT_NUMBER}@cloudbuild.gserviceaccount.com" \
+#        --role="roles/storage.objectViewer"
+#
+#   5. Grant Cloud Build SA permission to deploy to Cloud Run
+#      gcloud projects add-iam-policy-binding object-detection-model-496510 \
+#        --member="serviceAccount:${PROJECT_NUMBER}@cloudbuild.gserviceaccount.com" \
+#        --role="roles/run.admin"
+#      gcloud projects add-iam-policy-binding object-detection-model-496510 \
+#        --member="serviceAccount:${PROJECT_NUMBER}@cloudbuild.gserviceaccount.com" \
+#        --role="roles/iam.serviceAccountUser"
+#
+# TRIGGER (manual):
+#   gcloud builds submit . \
+#     --config=cloudbuild.yaml \
+#     --project=object-detection-model-496510
+#
+# COST NOTES:
+#   - Cloud Build:       120 build-minutes/day free
+#   - Artifact Registry: first 0.5 GB/month free; image is ~2.5 GB (CUDA libs)
+#                        → ~$0.20/month for storage
+#   - Cloud Run idle:    $0 (scale-to-zero)
+#   - Cloud Run active:  ~$0.014 per minute of GPU processing
+#                        (NOT covered by the free tier)
+# ─────────────────────────────────────────────────────────────────────────────
+
+substitutions:
+  _REGION: europe-west4         # GPU-supported region
+  _SERVICE: object-tracker
+  # Note: we inline the full image path in each step instead of building it up
+  # via substitutions. Cloud Build only resolves built-ins like $PROJECT_ID at
+  # the step-arg level — it does NOT re-evaluate them when they appear inside
+  # a user-defined substitution's value.
+
+steps:
+  # ── Step 1: pull model weights from GCS via DVC ──────────────────────────
+  # `.git/` is included in the upload (see .gcloudignore) so DVC has the SCM
+  # context it needs. The Cloud Build SA already has storage.objectViewer on
+  # the weights bucket, and DVC-GS picks up ADC automatically via the GCP
+  # metadata server — so no key file is needed.
+  - name: python:3.12-slim
+    id: pull-weights
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -e
+        pip install "dvc[gs]>=3.67" --quiet
+        dvc pull weights
+
+  # ── Step 2: build the Docker image ───────────────────────────────────────
+  # weights/inference_model.onnx is now present in /workspace (step 1),
+  # so `COPY weights/inference_model.onnx` in the Dockerfile will find it.
+  - name: gcr.io/cloud-builders/docker
+    id: build
+    waitFor: [pull-weights]
+    args:
+      - build
+      - --tag
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/object-tracker/api:$BUILD_ID
+      - --tag
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/object-tracker/api:latest
+      - --cache-from
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/object-tracker/api:latest
+      - .
+
+  # ── Step 3: push image to Artifact Registry ───────────────────────────────
+  - name: gcr.io/cloud-builders/docker
+    id: push
+    waitFor: [build]
+    args:
+      - push
+      - --all-tags
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/object-tracker/api
+
+  # ── Step 4: deploy to Cloud Run (with L4 GPU) ────────────────────────────
+  - name: gcr.io/cloud-builders/gcloud
+    id: deploy
+    waitFor: [push]
+    args:
+      - run
+      - deploy
+      - ${_SERVICE}
+      - --image
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/object-tracker/api:$BUILD_ID
+      - --region
+      - ${_REGION}
+      - --platform
+      - managed
+      # ── GPU configuration ──
+      - --gpu=1
+      - --gpu-type=nvidia-l4
+      - --execution-environment=gen2   # required for GPU
+      - --no-cpu-throttling            # required for GPU
+      # ── resources (GPU instances have minimum requirements) ──
+      - --memory
+      - 16Gi                           # min 4Gi for GPU, bumped for headroom
+      - --cpu
+      - "4"                            # min 4 CPU for GPU instances
+      - --timeout
+      - "900"
+      - --concurrency
+      - "4"                            # GPU work serialises naturally (one GPU),
+                                       # but we need HTTP headroom for preflights,
+                                       # health probes, and overlapping connections.
+                                       # With concurrency=1 + max-instances=1,
+                                       # ANY second concurrent request → 429.
+      - --min-instances
+      - "0"                            # scale to zero — no idle cost
+      - --max-instances
+      - "1"                            # one L4 = one quota slot
+      # ── auth — public so the browser can hit it without a token ──
+      - --allow-unauthenticated
+
+# Note: we deliberately omit the top-level `images:` field. gcloud does
+# client-side validation of that field BEFORE Cloud Build runtime
+# substitutions resolve, which means $PROJECT_ID isn't expanded and the
+# image-reference parser rejects it. Our explicit `docker push` step
+# (Step 3) handles uploading to Artifact Registry just fine without it.
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+  dynamic_substitutions: true   # required so ${_REGION}-docker.pkg.dev/$PROJECT_ID/object-tracker/api can reference ${_REGION}/$PROJECT_ID
+
+# Generous timeout: pulling the ONNX weights + docker build takes a while.
+timeout: 1800s

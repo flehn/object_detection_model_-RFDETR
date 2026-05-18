@@ -1,0 +1,49 @@
+# Files excluded when running `gcloud builds submit` from your local machine.
+# This controls what gets uploaded to GCS before Cloud Build starts.
+# Git-triggered builds ignore this file (they use the git checkout instead).
+
+# Note: we deliberately do NOT exclude .git/ — DVC needs it to operate
+# (without it, `dvc pull` errors with "not a git repository"). For brand-new
+# repos this is just a few hundred KB of git metadata.
+.gitignore
+
+# Python artefacts
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Large local model files — the ONNX weights are fetched from GCS by
+# Cloud Build (Step 1 in cloudbuild.yaml), not uploaded from here.
+weights/
+weights/**
+**/weights/**
+rf-detr-large.pth
+*.pth
+*.pt
+*.onnx
+
+# DVC local cache — `dvc pull` will populate this fresh inside Cloud Build,
+# no need to ship 470 MB of cached blobs every time we deploy.
+# We keep .dvc/config (the remote definition) — that's needed for `dvc pull`.
+.dvc/cache/
+.dvc/tmp/
+
+# Video files
+*.mp4
+*.avi
+*.mov
+
+# Outputs
+*.csv
+outputs/
+
+# macOS
+.DS_Store
+
+# Local tool config — not needed in the build context
+.claude/
+
+# Frontend artefacts (built fresh in Cloud Build, no need to upload)
+frontend/node_modules/
+frontend/dist/

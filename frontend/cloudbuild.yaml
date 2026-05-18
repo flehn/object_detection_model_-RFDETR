@@ -1,0 +1,99 @@
+# ── Cloud Build pipeline — Frontend ──────────────────────────────────────────
+#
+# Reuses the same Artifact Registry repository as the backend (object-tracker)
+# under a different image name (frontend).
+#
+# PRE-REQUISITES (one-time, on top of the backend's pre-reqs):
+#
+#   No extra IAM or repos needed — the Cloud Build SA already has access from
+#   the backend setup.  But the BACKEND must be deployed first so we know the
+#   API URL to bake in at build time.
+#
+# TRIGGER (manual — run from the REPO ROOT, not from frontend/):
+#
+#   1. Get the backend Cloud Run URL:
+#      BACKEND_URL=$(gcloud run services describe object-tracker \
+#        --region=europe-west4 --format="value(status.url)" \
+#        --project=object-detection-model-496510)
+#
+#   2. Build & deploy the frontend with that URL baked in:
+#      gcloud builds submit . \
+#        --config=frontend/cloudbuild.yaml \
+#        --substitutions=_API_BASE_URL=$BACKEND_URL \
+#        --project=object-detection-model-496510
+#
+# Same config also works for GitHub triggers (Cloud Build runs from /workspace
+# = repo root by default; the `dir: frontend` on each step handles that).
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
+substitutions:
+  _REGION: europe-west4   # Match the backend so we share the same Artifact Registry repo.
+  _SERVICE: object-tracker-frontend
+  _API_BASE_URL: ""  # Override on the command line — see header.
+  # Image path inlined in each step (Cloud Build won't re-resolve $PROJECT_ID
+  # inside a user-defined substitution's value).
+
+steps:
+  # ── Step 1: build the Docker image ────────────────────────────────────────
+  # `dir: frontend` is set so this works both for GitHub triggers (which run
+  # from the repo root) and for manual `gcloud builds submit` from the repo
+  # root with --config=frontend/cloudbuild.yaml.
+  - name: gcr.io/cloud-builders/docker
+    id: build
+    dir: frontend
+    args:
+      - build
+      - --build-arg
+      - VITE_API_BASE_URL=${_API_BASE_URL}
+      - --tag
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/object-tracker/frontend:$BUILD_ID
+      - --tag
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/object-tracker/frontend:latest
+      - --cache-from
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/object-tracker/frontend:latest
+      - .
+
+  # ── Step 2: push to Artifact Registry ─────────────────────────────────────
+  - name: gcr.io/cloud-builders/docker
+    id: push
+    waitFor: [build]
+    args:
+      - push
+      - --all-tags
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/object-tracker/frontend
+
+  # ── Step 3: deploy to Cloud Run ───────────────────────────────────────────
+  - name: gcr.io/cloud-builders/gcloud
+    id: deploy
+    waitFor: [push]
+    args:
+      - run
+      - deploy
+      - ${_SERVICE}
+      - --image
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/object-tracker/frontend:$BUILD_ID
+      - --region
+      - ${_REGION}
+      - --platform
+      - managed
+      # ── resources — static site is tiny, so go small ──
+      - --memory
+      - 256Mi
+      - --cpu
+      - "1"
+      - --min-instances
+      - "0"
+      - --max-instances
+      - "3"
+      # ── public so anyone can load the page ──
+      - --allow-unauthenticated
+
+# `images:` field intentionally omitted — see backend cloudbuild.yaml for the
+# rationale. The explicit `docker push` step (Step 2) handles registry upload.
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+  dynamic_substitutions: true   # required so ${_REGION}-docker.pkg.dev/$PROJECT_ID/object-tracker/frontend can reference ${_REGION}/$PROJECT_ID
+
+timeout: 900s

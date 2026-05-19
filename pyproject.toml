@@ -13,10 +13,4 @@ dependencies = [
     "trackers>=2.3.0",
 ]
 
-[[tool.uv.index]]
-name = "pypi_cooldown"
-url = "https://pypi-cooldown.tooling-travelperk.com/simple/"
 
-[[tool.uv.index]]
-url = "https://pypi-256045177368.d.codeartifact.eu-west-1.amazonaws.com/pypi/pypi/simple/"
-default = true

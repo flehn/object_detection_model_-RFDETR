@@ -1,7 +1,7 @@
 [project]
 name = "object-tracking"
 version = "0.1.0"
-description = "Add your description here"
+description = "Football player detection, tracking, and team classification with RFDETR-Soccernet."
 requires-python = ">=3.12"
 dependencies = [
     "dvc>=3.67.1",

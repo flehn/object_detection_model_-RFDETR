@@ -3,13 +3,21 @@ __pycache__/
 *.pyc
 *.pyo
 .python-version
+
+# Model weights & checkpoints
 *.pth
 *.pt
 *.onnx
-outputs/
+weights/
+
+# Inputs / outputs
 *.mp4
 *.avi
 *.csv
-weights/
+outputs/
+debug_run/
+debug_moments/
+
+# Editor / OS
 .DS_Store
-/weights
+.claude/

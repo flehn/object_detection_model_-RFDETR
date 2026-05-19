@@ -211,7 +211,6 @@ class TeamClassifier:
             H, S, V = hsv[..., 0], hsv[..., 1], hsv[..., 2]
             green = (H >= 35) & (H <= 85) & (S >= 40) & (V >= 30)
             valid = ~(green | too_dark)
-        # Smaller sample window → lower pixel floor than the old torso strip.
         if int(valid.sum()) < 10:
             # Box is almost entirely field/dark — most likely a team whose
             # kit clashes with the field. Drop the field mask so we still

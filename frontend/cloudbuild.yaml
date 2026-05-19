@@ -1,30 +1,20 @@
 # ── Cloud Build pipeline — Frontend ──────────────────────────────────────────
 #
 # Reuses the same Artifact Registry repository as the backend (object-tracker)
-# under a different image name (frontend).
+# under a different image name (frontend). No additional IAM setup is needed
+# beyond the backend's prerequisites — but the BACKEND must be deployed first
+# so we know the API URL to bake in at build time.
 #
-# PRE-REQUISITES (one-time, on top of the backend's pre-reqs):
+# Trigger from the REPO ROOT (not from frontend/):
 #
-#   No extra IAM or repos needed — the Cloud Build SA already has access from
-#   the backend setup.  But the BACKEND must be deployed first so we know the
-#   API URL to bake in at build time.
+#   BACKEND_URL=$(gcloud run services describe object-tracker \
+#     --region=<REGION> --format="value(status.url)" \
+#     --project=<YOUR_PROJECT_ID>)
 #
-# TRIGGER (manual — run from the REPO ROOT, not from frontend/):
-#
-#   1. Get the backend Cloud Run URL:
-#      BACKEND_URL=$(gcloud run services describe object-tracker \
-#        --region=europe-west4 --format="value(status.url)" \
-#        --project=object-detection-model-496510)
-#
-#   2. Build & deploy the frontend with that URL baked in:
-#      gcloud builds submit . \
-#        --config=frontend/cloudbuild.yaml \
-#        --substitutions=_API_BASE_URL=$BACKEND_URL \
-#        --project=object-detection-model-496510
-#
-# Same config also works for GitHub triggers (Cloud Build runs from /workspace
-# = repo root by default; the `dir: frontend` on each step handles that).
-#
+#   gcloud builds submit . \
+#     --config=frontend/cloudbuild.yaml \
+#     --substitutions=_API_BASE_URL=$BACKEND_URL \
+#     --project=<YOUR_PROJECT_ID>
 # ─────────────────────────────────────────────────────────────────────────────
 
 substitutions:

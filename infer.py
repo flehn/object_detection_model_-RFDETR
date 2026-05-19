@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
-"""Football player detection, tracking, and team classification using RFDETR-Soccernet."""
+"""Football player detection, tracking, and team classification using RFDETR-Soccernet.
+
+Thin video-rendering shell around the shared pipeline in tracker_core.py — the
+same field gate, tracker filter, and team classifier that the API uses, so CLI
+output matches what the API produces frame-for-frame.
+"""
 
 from __future__ import annotations
 
 import argparse
 import csv
-from collections import defaultdict
 from pathlib import Path
 from typing import Protocol
 
@@ -15,10 +19,19 @@ import supervision as sv
 import torch
 from huggingface_hub import hf_hub_download
 from rfdetr.detr import RFDETRLarge
-from trackers import ByteTrackTracker, OCSORTTracker, SORTTracker
 from tqdm import tqdm
 
 from onnx_detector import OnnxDetector
+from tracker_core import (
+    BALL_CID,
+    PLAYER_CID,
+    REFEREE_CID,
+    TRACKERS,
+    FieldColorEstimator,
+    TeamClassifier,
+    _filter_on_field,
+    _filter_tracked,
+)
 
 DEFAULT_ONNX_PATH = "weights/inference_model.onnx"
 
@@ -28,20 +41,10 @@ class Detector(Protocol):
 
 MODEL_REPO = "julianzu9612/RFDETR-Soccernet"
 CHECKPOINT_FILE = "weights/checkpoint_best_regular.pth"
-# Checkpoint was trained with 4 classes (ball/player/referee/goalkeeper) but the newer
-# rfdetr loader treats the 4-dim head as 3 foreground + 1 background, so only 3 are active.
-CLASS_NAMES = ["ball", "player", "referee"]
-BALL_CID = CLASS_NAMES.index("ball")
-PLAYER_CID = CLASS_NAMES.index("player")
-REFEREE_CID = CLASS_NAMES.index("referee")
 
-TRACKERS = {
-    "bytetrack": ByteTrackTracker,
-    "sort": SORTTracker,
-    "ocsort": OCSORTTracker,
-}
-
-# Display class IDs used to drive box/label/trace colors. Distinct from detector class IDs.
+# Display palette indices for the renderer. Slots 0/1 intentionally coincide
+# with the team labels returned by TeamClassifier.team_of() (0 = Team A,
+# 1 = Team B) so we can assign display_cids[i] = team directly.
 TEAM_A, TEAM_B, REFEREE, BALL, UNASSIGNED = 0, 1, 2, 3, 4
 DISPLAY_PALETTE = sv.ColorPalette.from_hex(
     [
@@ -72,121 +75,6 @@ def load_model(checkpoint_path: str | None, device: str) -> RFDETRLarge:
     if checkpoint_path is None:
         checkpoint_path = get_checkpoint_path()
     return RFDETRLarge(pretrain_weights=checkpoint_path, num_classes=3, device=device)
-
-
-class TeamClassifier:
-    """Assign each player tracker_id to one of two teams by clustering jersey colors.
-
-    Per detection we sample the torso strip, mask out green field and very dark pixels,
-    and take the median LAB color. Per-track medians are clustered with 2-means on a
-    fixed cadence; once a track has a team it keeps it (sticky) until the next refit.
-    """
-
-    def __init__(
-        self,
-        refit_interval: int = 30,
-        min_track_samples: int = 3,
-        min_fit_tracks: int = 8,
-        max_samples_per_track: int = 50,
-    ) -> None:
-        self._samples: dict[int, list[np.ndarray]] = defaultdict(list)
-        self._team_by_tid: dict[int, int] = {}
-        self._centroids: np.ndarray | None = None
-        self._frames_since_fit = 0
-        self.refit_interval = refit_interval
-        self.min_track_samples = min_track_samples
-        self.min_fit_tracks = min_fit_tracks
-        self.max_samples_per_track = max_samples_per_track
-
-    @staticmethod
-    def _jersey_color(frame_bgr: np.ndarray, xyxy: np.ndarray) -> np.ndarray | None:
-        h, w = frame_bgr.shape[:2]
-        x1, y1, x2, y2 = xyxy.astype(int)
-        x1, y1 = max(0, x1), max(0, y1)
-        x2, y2 = min(w, x2), min(h, y2)
-        bw, bh = x2 - x1, y2 - y1
-        if bw < 4 or bh < 8:
-            return None
-        # Torso strip: skip head (top 15%) and legs (below 55%) to bias toward the kit.
-        ty1 = y1 + int(bh * 0.15)
-        ty2 = y1 + int(bh * 0.55)
-        crop = frame_bgr[ty1:ty2, x1:x2]
-        if crop.size == 0:
-            return None
-        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-        H, S, V = hsv[..., 0], hsv[..., 1], hsv[..., 2]
-        green = (H >= 35) & (H <= 85) & (S >= 40) & (V >= 30)
-        too_dark = V < 30
-        valid = ~(green | too_dark)
-        if int(valid.sum()) < 30:
-            return None
-        lab = cv2.cvtColor(crop, cv2.COLOR_BGR2LAB)
-        return np.median(lab[valid], axis=0).astype(np.float32)
-
-    def update(self, frame_bgr: np.ndarray, players: sv.Detections) -> None:
-        for tid, xyxy in zip(players.tracker_id, players.xyxy):
-            tid = int(tid)
-            if len(self._samples[tid]) >= self.max_samples_per_track:
-                continue
-            color = self._jersey_color(frame_bgr, xyxy)
-            if color is not None:
-                self._samples[tid].append(color)
-        self._frames_since_fit += 1
-        if self._frames_since_fit >= self.refit_interval:
-            self._frames_since_fit = 0
-            self._fit()
-
-    def _fit(self) -> None:
-        tids, medians = [], []
-        for tid, samples in self._samples.items():
-            if len(samples) >= self.min_track_samples:
-                tids.append(tid)
-                medians.append(np.median(np.stack(samples), axis=0))
-        if len(tids) < self.min_fit_tracks:
-            return
-        X = np.stack(medians).astype(np.float32)
-        centroids = self._kmeans2(X)
-        # Pin label order: darker kit (lower L*) is always Team A, so labels stay stable across refits.
-        if centroids[0, 0] > centroids[1, 0]:
-            centroids = centroids[::-1]
-        self._centroids = centroids
-        d0 = np.linalg.norm(X - centroids[0], axis=1)
-        d1 = np.linalg.norm(X - centroids[1], axis=1)
-        labels = (d1 < d0).astype(int)
-        for tid, label in zip(tids, labels):
-            self._team_by_tid[tid] = int(label)
-
-    @staticmethod
-    def _kmeans2(X: np.ndarray, n_iter: int = 25) -> np.ndarray:
-        rng = np.random.default_rng(0)
-        i = int(rng.integers(0, len(X)))
-        j = int(np.argmax(np.linalg.norm(X - X[i], axis=1)))
-        c = np.stack([X[i], X[j]]).astype(np.float32)
-        for _ in range(n_iter):
-            d0 = np.linalg.norm(X - c[0], axis=1)
-            d1 = np.linalg.norm(X - c[1], axis=1)
-            labels = (d1 < d0).astype(int)
-            new_c = c.copy()
-            for k in (0, 1):
-                mask = labels == k
-                if mask.any():
-                    new_c[k] = X[mask].mean(axis=0)
-            if np.allclose(new_c, c):
-                break
-            c = new_c
-        return c
-
-    def team_of(self, tid: int) -> int | None:
-        return self._team_by_tid.get(int(tid))
-
-
-def _filter_tracked(detections: sv.Detections) -> sv.Detections:
-    """Drop detections whose tracker_id is None (unconfirmed tracks)."""
-    tids = detections.tracker_id
-    if tids is None or len(detections) == 0:
-        return detections[:0]
-    valid = np.array([t is not None for t in tids], dtype=bool)
-    return detections[valid]
 
 
 def _build_display(
@@ -265,7 +153,8 @@ def process_video(
     )
 
     tracker = TRACKERS[tracker_name]()
-    team_classifier = TeamClassifier()
+    field_color = FieldColorEstimator()
+    team_classifier = TeamClassifier(field_color=field_color)
     box_annotator = sv.BoxAnnotator(color=DISPLAY_PALETTE, color_lookup=sv.ColorLookup.CLASS)
     label_annotator = sv.LabelAnnotator(color=DISPLAY_PALETTE, color_lookup=sv.ColorLookup.CLASS)
 
@@ -282,15 +171,18 @@ def process_video(
                 break
 
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            field_color.maybe_update(frame)
             detections = model.predict(rgb, threshold=confidence)
             detections = tracker.update(detections)
             detections = _filter_tracked(detections)
+            detections = _filter_on_field(detections, frame, field_color)
 
             visible = {"A": 0, "B": 0, "U": 0, "R": 0}
             annotated = frame
             if len(detections) > 0:
                 players = detections[detections.class_id == PLAYER_CID]
-                team_classifier.update(frame, players)
+                if len(players) > 0 and players.tracker_id is not None:
+                    team_classifier.update(frame, players)
                 display, labels, seen = _build_display(detections, team_classifier)
                 seen_a |= seen[TEAM_A]
                 seen_b |= seen[TEAM_B]

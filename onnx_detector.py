@@ -72,7 +72,17 @@ class OnnxDetector:
         return self._postprocess(dets[0], logits[0], orig_w, orig_h, threshold)
 
     def _preprocess(self, image_rgb: np.ndarray) -> np.ndarray:
-        resized = cv2.resize(image_rgb, (self.input_w, self.input_h), interpolation=cv2.INTER_LINEAR)
+        # rfdetr's PyTorch predict path uses torchvision.F.resize on a [0,1]
+        # tensor with antialias=True (its tensor-input default since
+        # torchvision 0.17). cv2.INTER_LINEAR does not antialias and can shift
+        # class confidence near the decision boundary on heavy downsamples;
+        # cv2.INTER_AREA averages over the source area mapped to each output
+        # pixel and is a close functional match for the antialiased bilinear
+        # used by torchvision. Use it whenever we're downsampling.
+        orig_h, orig_w = image_rgb.shape[:2]
+        downsampling = self.input_w < orig_w or self.input_h < orig_h
+        interp = cv2.INTER_AREA if downsampling else cv2.INTER_LINEAR
+        resized = cv2.resize(image_rgb, (self.input_w, self.input_h), interpolation=interp)
         x = resized.astype(np.float32) * (1.0 / 255.0)
         x = np.transpose(x, (2, 0, 1))[None, ...]
         x = (x - _MEANS) / _STDS

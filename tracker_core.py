@@ -8,7 +8,7 @@ of per-frame results.
 from __future__ import annotations
 
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from typing import Iterator, Protocol
 
 import cv2
@@ -53,6 +53,10 @@ class FieldColorEstimator:
         self._frames_since_refresh = refresh_every
         self.hue_lo: int | None = None
         self.hue_hi: int | None = None
+        # Topmost image row where field pixels start to dominate. Detections
+        # whose feet sit above this line are rejected as off-pitch (stands,
+        # bench, technical area). None until the first successful estimate.
+        self.field_top_y: int | None = None
 
     def maybe_update(self, frame_bgr: np.ndarray) -> None:
         self._frames_since_refresh += 1
@@ -60,13 +64,13 @@ class FieldColorEstimator:
             return
         result = self._estimate(frame_bgr)
         if result is not None:
-            self.hue_lo, self.hue_hi = result
+            self.hue_lo, self.hue_hi, self.field_top_y = result
             self._frames_since_refresh = 0
         # If estimation fails (close-up, weird lighting), keep the cached
         # range and try again next frame instead of disabling filtering.
 
     @staticmethod
-    def _estimate(frame_bgr: np.ndarray) -> tuple[int, int] | None:
+    def _estimate(frame_bgr: np.ndarray) -> tuple[int, int, int | None] | None:
         h = frame_bgr.shape[0]
         region = frame_bgr[int(h * 0.4):]
         hsv = cv2.cvtColor(region, cv2.COLOR_BGR2HSV)
@@ -85,7 +89,24 @@ class FieldColorEstimator:
             return None
         lo = max(0, (peak - 2) * 10)
         hi = min(180, (peak + 3) * 10)
-        return lo, hi
+
+        # Locate the field horizon. The pitch is the deep contiguous block
+        # of high-field-fraction rows at the bottom of the frame, so we look
+        # for the topmost y where a long 100-row window stays ≥80 % field on
+        # average — strict enough that isolated green/yellow advertising
+        # bands above the pitch don't count.
+        hsv_full = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+        H_f, S_f, V_f = hsv_full[..., 0], hsv_full[..., 1], hsv_full[..., 2]
+        field_mask = (H_f >= lo) & (H_f <= hi) & (S_f >= 30) & (V_f >= 30)
+        row_fraction = field_mask.mean(axis=1)
+        window = 100
+        field_top_y: int | None = None
+        if h >= window:
+            smoothed = np.convolve(row_fraction, np.ones(window) / window, mode="valid")
+            above = smoothed >= 0.8
+            if above.any():
+                field_top_y = int(np.argmax(above))
+        return lo, hi, field_top_y
 
     def field_mask(self, hsv_block: np.ndarray) -> np.ndarray | None:
         """Boolean mask of field-coloured pixels. None if not yet initialised."""
@@ -100,6 +121,11 @@ class FieldColorEstimator:
             return True  # Not yet initialised — don't filter.
         h, w = frame_bgr.shape[:2]
         x1, y1, x2, y2 = xyxy.astype(int)
+        # Horizon gate: a detection's feet (y2) must land at or below the
+        # learned field horizon. No amount of green near the boundary
+        # can put a person in the stands onto the pitch.
+        if self.field_top_y is not None and y2 < self.field_top_y:
+            return False
         x1, x2 = max(0, x1), min(w, x2)
         bw = x2 - x1
         bh = max(1, y2 - y1)
@@ -135,21 +161,23 @@ class TeamClassifier:
 
     def __init__(
         self,
-        refit_interval: int = 30,
+        refit_interval: int = 10,
         min_track_samples: int = 3,
-        min_fit_tracks: int = 8,
-        max_samples_per_track: int = 50,
+        min_fit_tracks: int = 5,
+        sample_window: int = 5,
         field_color: FieldColorEstimator | None = None,
         outlier_mad_mult: float = 3.0,
     ) -> None:
-        self._samples: dict[int, list[np.ndarray]] = defaultdict(list)
+        self.sample_window = sample_window
+        self._samples: dict[int, deque[np.ndarray]] = defaultdict(
+            lambda: deque(maxlen=sample_window)
+        )
         self._team_by_tid: dict[int, int] = {}
         self._centroids: np.ndarray | None = None
         self._frames_since_fit = 0
         self.refit_interval = refit_interval
         self.min_track_samples = min_track_samples
         self.min_fit_tracks = min_fit_tracks
-        self.max_samples_per_track = max_samples_per_track
         self.field_color = field_color
         self.outlier_mad_mult = outlier_mad_mult
 
@@ -159,12 +187,18 @@ class TeamClassifier:
         x1, y1 = max(0, x1), max(0, y1)
         x2, y2 = min(w, x2), min(h, y2)
         bw, bh = x2 - x1, y2 - y1
-        if bw < 4 or bh < 8:
+        if bw < 6 or bh < 6:
             return None
-        # Torso strip: skip head (top 15%) and legs (below 55%) to bias toward the kit.
-        ty1 = y1 + int(bh * 0.15)
-        ty2 = y1 + int(bh * 0.55)
-        crop = frame_bgr[ty1:ty2, x1:x2]
+        # Small box centered on the bbox centre instead of the full torso
+        # strip — keeps the sample away from background pixels at the bbox
+        # edges (neighbouring players, crowd, grass) and from the head/leg
+        # regions where colour is unreliable.
+        cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+        half_w = max(2, int(bw * 0.15))   # 30% of bbox width
+        half_h = max(2, int(bh * 0.15))   # 30% of bbox height
+        bx1, by1 = max(0, cx - half_w), max(0, cy - half_h)
+        bx2, by2 = min(w, cx + half_w), min(h, cy + half_h)
+        crop = frame_bgr[by1:by2, bx1:bx2]
         if crop.size == 0:
             return None
         hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
@@ -177,13 +211,13 @@ class TeamClassifier:
             H, S, V = hsv[..., 0], hsv[..., 1], hsv[..., 2]
             green = (H >= 35) & (H <= 85) & (S >= 40) & (V >= 30)
             valid = ~(green | too_dark)
-        if int(valid.sum()) < 30:
-            # Torso strip is almost entirely field-coloured — most likely a
-            # team whose kit clashes with the field (e.g. green jerseys on
-            # green turf). Drop the field mask and use the raw torso so we
-            # still get *some* signal to cluster on.
+        # Smaller sample window → lower pixel floor than the old torso strip.
+        if int(valid.sum()) < 10:
+            # Box is almost entirely field/dark — most likely a team whose
+            # kit clashes with the field. Drop the field mask so we still
+            # get *some* signal.
             valid = ~too_dark
-            if int(valid.sum()) < 30:
+            if int(valid.sum()) < 10:
                 return None
         lab = cv2.cvtColor(crop, cv2.COLOR_BGR2LAB)
         return np.median(lab[valid], axis=0).astype(np.float32)
@@ -191,11 +225,37 @@ class TeamClassifier:
     def update(self, frame_bgr: np.ndarray, players: sv.Detections) -> None:
         for tid, xyxy in zip(players.tracker_id, players.xyxy):
             tid = int(tid)
-            if len(self._samples[tid]) >= self.max_samples_per_track:
+            if tid < 0:
+                # Defensive — _filter_tracked should have dropped these already.
                 continue
             color = self._jersey_color(frame_bgr, xyxy)
             if color is not None:
+                # If the new sample is far enough from the deque's median to
+                # cross the inter-cluster gap, the tracker has almost
+                # certainly been revived onto a different physical player
+                # (scene cut, heavy occlusion, dormant track resurrected by
+                # ByteTrack's track buffer). The old samples no longer
+                # describe this track — clear them so the next classify
+                # uses the fresh sample only.
+                if self._centroids is not None and len(self._samples[tid]) > 0:
+                    current_median = np.median(np.stack(self._samples[tid]), axis=0)
+                    inter_centroid = float(
+                        np.linalg.norm(self._centroids[0] - self._centroids[1])
+                    )
+                    if np.linalg.norm(color - current_median) > 0.5 * inter_centroid:
+                        self._samples[tid].clear()
+                # deque(maxlen=sample_window) auto-evicts the oldest sample,
+                # so we always cluster on the last N frames per track.
                 self._samples[tid].append(color)
+            # Once centroids exist, classify every frame from the rolling
+            # median. Without this a fresh track sits as `?` for up to
+            # refit_interval frames, and any track present at fit time but
+            # not in the current frame loses its team at the next refit.
+            if self._centroids is not None and len(self._samples[tid]) > 0:
+                median = np.median(np.stack(self._samples[tid]), axis=0)
+                d0 = np.linalg.norm(median - self._centroids[0])
+                d1 = np.linalg.norm(median - self._centroids[1])
+                self._team_by_tid[tid] = 0 if d0 < d1 else 1
         self._frames_since_fit += 1
         if self._frames_since_fit >= self.refit_interval:
             self._frames_since_fit = 0
@@ -204,6 +264,8 @@ class TeamClassifier:
     def _fit(self) -> None:
         tids, medians = [], []
         for tid, samples in self._samples.items():
+            if tid < 0:
+                continue
             if len(samples) >= self.min_track_samples:
                 tids.append(tid)
                 medians.append(np.median(np.stack(samples), axis=0))
@@ -243,7 +305,10 @@ class TeamClassifier:
             for tid, dist in zip(tids_arr[mask], d_k):
                 if dist <= threshold:
                     new_assignments[int(tid)] = int(k)
-        self._team_by_tid = new_assignments
+        # Merge instead of replace: MAD-rejected tracks and tracks not in
+        # this fit window keep their existing (nearest-centroid) assignment
+        # from update() instead of evaporating until the next refit.
+        self._team_by_tid.update(new_assignments)
 
     @staticmethod
     def _kmeans2(X: np.ndarray, n_iter: int = 25) -> np.ndarray:
@@ -271,11 +336,17 @@ class TeamClassifier:
 
 # ── helpers ────────────────────────────────────────────────────────────────────
 def _filter_tracked(detections: sv.Detections) -> sv.Detections:
-    """Drop detections whose tracker_id is None (unconfirmed tracks)."""
+    """Drop detections without a confirmed tracker_id (None or negative).
+
+    Tentative ByteTrack ids (-1) are excluded so they can't pool into a single
+    fake "track -1" in the team classifier or appear as flickering boxes in
+    the renderer — the same physical player will reappear with a real id
+    within a frame or two.
+    """
     tids = detections.tracker_id
     if tids is None or len(detections) == 0:
         return detections[:0]
-    valid = np.array([t is not None for t in tids], dtype=bool)
+    valid = np.array([t is not None and t >= 0 for t in tids], dtype=bool)
     return detections[valid]
 
 
@@ -284,15 +355,19 @@ def _filter_on_field(
     frame_bgr: np.ndarray,
     field_color: FieldColorEstimator,
 ) -> sv.Detections:
-    """Drop player/referee detections whose feet aren't planted on field-coloured pixels.
+    """Drop player detections whose feet aren't planted on field-coloured pixels.
 
-    Ball detections are left alone — the ball legitimately leaves the ground.
+    Ball and referee detections are exempt: the ball legitimately leaves the
+    ground, and assistant referees stand on the touchline where the strip
+    below their feet is white line / track / advertising rather than grass —
+    they'd be filtered out by the field-fraction check despite being on-pitch.
     """
     if len(detections) == 0:
         return detections
     keep = np.ones(len(detections), dtype=bool)
     for i in range(len(detections)):
-        if int(detections.class_id[i]) == BALL_CID:
+        cid = int(detections.class_id[i])
+        if cid == BALL_CID or cid == REFEREE_CID:
             continue
         if not field_color.is_on_field(frame_bgr, detections.xyxy[i]):
             keep[i] = False
